@@ -3535,23 +3535,18 @@ impl<'a> Visit<'a> for TSEnumCaptureVisitor<'_, 'a> {
     }
 }
 
-/// Whether preserving an enum as an opaque node would hide a capture from the
-/// nested function's HIR. Top-level component enums cannot capture component
-/// state, and module bindings are outside the captured scope range.
+/// Whether preserving an enum as an opaque node would hide a reference to a
+/// component-local binding from HIR analysis. Include the current function:
+/// enum initializers can read or mutate its locals, not only captured bindings.
+/// Module bindings remain outside the captured scope range.
 fn ts_enum_has_captured_reference<'a>(
     builder: &HirBuilder<'a, '_>,
     declaration: &oxc::TSEnumDeclaration<'a>,
 ) -> bool {
     let function_scope = builder.function_scope();
-    if function_scope == builder.component_scope() {
-        return false;
-    }
-    let Some(parent_scope) = builder.scope().scope_parent(function_scope) else {
-        return false;
-    };
     let mut visitor = TSEnumCaptureVisitor {
         scope: builder.scope(),
-        captured_scopes: capture_scopes(builder.scope(), parent_scope, builder.component_scope()),
+        captured_scopes: capture_scopes(builder.scope(), function_scope, builder.component_scope()),
         found: false,
     };
     visitor.visit_ts_enum_declaration(declaration);
@@ -6581,7 +6576,7 @@ fn lower_statement<'a>(
 
             // Opaque statements are emitted into the flattened HIR statement stream.
             // Skip compilation when that would erase an enum's lexical block, or
-            // when an enum-only reference would hide a nested-function capture.
+            // when an enum-only reference would hide a local read, write, or capture.
             // This retains upstream's operand-free UnsupportedNode representation
             // without changing the source program's runtime semantics.
             if loses_lexical_scope || ts_enum_has_captured_reference(builder, enum_decl) {

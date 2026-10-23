@@ -754,3 +754,13 @@ export default Component;\n";
     assert!(output.contains("// keep: trailing"), "trailing comment lost:\n{output}");
     assert!(!output.contains("// drop: inner"), "inner comment should not be recovered:\n{output}");
 }
+
+#[test]
+fn preserves_inline_enum_component_variable_mutation() {
+    let source = include_str!("../fixtures/ts-enum-inline-write.tsx");
+    let allocator = Allocator::default();
+    let (program, result) = transform_source(source, SourceType::tsx(), &allocator, options());
+    assert!(!result.fatal);
+    assert!(!result.changed, "opaque enum initializer must not hide component variable effects");
+    assert!(Codegen::new().build(&program).code.contains("count++"));
+}
