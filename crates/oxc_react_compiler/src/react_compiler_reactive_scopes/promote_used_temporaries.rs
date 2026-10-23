@@ -51,8 +51,12 @@ struct PrunedInfo {
 }
 
 /// Interposed-temporary tracking state, indexed densely by identifier id.
-/// Each entry holds the tracked identifier and whether it needs promotion.
-type InterState = IndexVec<IdentifierId, Option<(IdentifierId, bool)>>;
+/// Each temporary records the effect epoch at which it was tracked. Advancing
+/// the epoch marks all existing entries for promotion without scanning them.
+struct InterState {
+    tracked: IndexVec<IdentifierId, Option<(IdentifierId, usize)>>,
+    effect_epoch: usize,
+}
 
 // =============================================================================
 // Public entry point
@@ -99,7 +103,10 @@ pub fn promote_used_temporaries(func: &mut ReactiveFunction, env: &mut Environme
             }
         }
     }
-    let mut inter_state: InterState = IndexVec::from_vec(vec![None; env.identifiers.len()]);
+    let mut inter_state = InterState {
+        tracked: IndexVec::from_vec(vec![None; env.identifiers.len()]),
+        effect_epoch: 0,
+    };
     promote_interposed_block(
         &func.body,
         &mut state,
@@ -531,9 +538,12 @@ fn promote_interposed_place(
     consts: &FxHashSet<IdentifierId>,
     env: &mut Environment,
 ) {
-    if let Some((id, needs_promotion)) = inter_state[place.identifier] {
+    if let Some((id, tracked_epoch)) = inter_state.tracked[place.identifier] {
         let identifier = &env.identifiers[id];
-        if needs_promotion && identifier.name.is_none() && !consts.contains(&id) {
+        if tracked_epoch != inter_state.effect_epoch
+            && identifier.name.is_none()
+            && !consts.contains(&id)
+        {
             promote_identifier(id, state, env);
         }
     }
@@ -605,14 +615,13 @@ fn promote_interposed_instruction(
                                 .is_some())
                     {
                         // Mark all tracked temporaries as needing promotion
-                        for entry in inter_state.iter_mut().flatten() {
-                            entry.1 = true;
-                        }
+                        inter_state.effect_epoch += 1;
                     }
                     if let Some(lvalue) = &instr.lvalue {
                         let identifier = &env.identifiers[lvalue.identifier];
                         if identifier.name.is_none() {
-                            inter_state[lvalue.identifier] = Some((lvalue.identifier, false));
+                            inter_state.tracked[lvalue.identifier] =
+                                Some((lvalue.identifier, inter_state.effect_epoch));
                         }
                     }
                 }
@@ -636,7 +645,8 @@ fn promote_interposed_instruction(
                             if consts.contains(&load_place.identifier) {
                                 consts.insert(lvalue.identifier);
                             }
-                            inter_state[lvalue.identifier] = Some((lvalue.identifier, false));
+                            inter_state.tracked[lvalue.identifier] =
+                                Some((lvalue.identifier, inter_state.effect_epoch));
                         }
                     }
                     // Visit operands
@@ -653,7 +663,8 @@ fn promote_interposed_instruction(
                         }
                         let identifier = &env.identifiers[lvalue.identifier];
                         if identifier.name.is_none() {
-                            inter_state[lvalue.identifier] = Some((lvalue.identifier, false));
+                            inter_state.tracked[lvalue.identifier] =
+                                Some((lvalue.identifier, inter_state.effect_epoch));
                         }
                     }
                     // Visit operands

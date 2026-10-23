@@ -13,10 +13,10 @@
 //! - `src/HIR/DeriveMinimalDependenciesHIR.ts`
 
 use crate::react_compiler_utils::FxIndexMap;
+use fixedbitset::FixedBitSet;
 use oxc_allocator::{Allocator, CloneIn, Vec as ArenaVec};
 use oxc_index::IndexVec;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
 use std::collections::BTreeSet;
 use std::ptr::eq;
 
@@ -52,24 +52,17 @@ pub fn propagate_scope_dependencies_hir<'a>(func: &mut HirFunction<'a>, env: &mu
         hoistable_objects,
     } = collect_optional_chain_sidemap(func, env);
 
-    let hoistable_property_loads = {
-        let (working, registry) =
-            collect_hoistable_and_propagate(func, env, &temporaries, &hoistable_objects);
-        // Convert to scope-keyed map with full dependency paths
-        let mut keyed: FxHashMap<ScopeId, Vec<ReactiveScopeDependency>> = FxHashMap::default();
-        for (_block_id, block) in &func.body.blocks {
-            if let Terminal::Scope { scope, block: inner_block, .. } = &block.terminal
-                && let Some(node_indices) = working.get(inner_block)
-            {
-                let deps: Vec<ReactiveScopeDependency> = node_indices
-                    .iter()
-                    .map(|&idx| registry.nodes[idx].full_path.clone_in(env.allocator))
-                    .collect();
-                keyed.insert(*scope, deps);
-            }
+    let (working, registry) =
+        collect_hoistable_and_propagate(func, env, &temporaries, &hoistable_objects);
+    // Keep the registry paths shared instead of cloning every path into every scope.
+    let mut hoistable_property_loads: FxHashMap<ScopeId, &PropertyPathSet> = FxHashMap::default();
+    for block in func.body.blocks.values() {
+        if let Terminal::Scope { scope, block: inner_block, .. } = &block.terminal
+            && let Some(node_indices) = working.get(inner_block)
+        {
+            hoistable_property_loads.insert(*scope, node_indices);
         }
-        keyed
-    };
+    }
 
     // Merge temporaries + temporariesReadInOptional
     let mut merged_temporaries = temporaries;
@@ -93,7 +86,12 @@ pub fn propagate_scope_dependencies_hir<'a>(func: &mut HirFunction<'a>, env: &mu
             hoistables.expect("[PropagateScopeDependencies] Scope not found in tracked blocks");
 
         // Step 2: Calculate hoistable dependencies using the tree.
-        let mut tree = ReactiveScopeDependencyTreeHIR::new(hoistables.iter());
+        // Dependency trees only consult hoistability for their own root identifiers.
+        let roots: FxHashSet<IdentifierId> = deps.iter().map(|dep| dep.identifier).collect();
+        let mut tree = ReactiveScopeDependencyTreeHIR::new(
+            hoistables.ones().map(|idx| &registry.nodes[idx].full_path),
+            &roots,
+        );
         for dep in deps {
             tree.add_dependency(dep.clone_in(env.allocator));
         }
@@ -786,52 +784,27 @@ struct PropertyPathNode<'a> {
 struct PropertyPathRegistry<'a> {
     nodes: Vec<PropertyPathNode<'a>>,
     roots: FxHashMap<IdentifierId, usize>,
+    has_optional_paths: bool,
     alloc: &'a Allocator,
 }
 
-type PropertyPathSet = SmallVec<[usize; 8]>;
+// Registry node IDs are dense. Bitsets keep growing CFG facts compact and make
+// propagation unions/intersections operate on words rather than individual IDs.
+type PropertyPathSet = FixedBitSet;
 
 #[inline]
 fn insert_property_path(paths: &mut PropertyPathSet, path: usize) {
-    if let Err(index) = paths.binary_search(&path) {
-        paths.insert(index, path);
-    }
+    paths.grow_and_insert(path);
 }
 
 #[inline]
 fn remove_property_path(paths: &mut PropertyPathSet, path: usize) {
-    if let Ok(index) = paths.binary_search(&path) {
-        paths.remove(index);
-    }
-}
-
-fn union_property_paths(
-    paths: &mut PropertyPathSet,
-    original_paths: &[usize],
-    propagated_paths: &[usize],
-) {
-    paths.clear();
-    paths.reserve(original_paths.len() + propagated_paths.len());
-
-    let mut original = original_paths.iter().copied().peekable();
-    let mut propagated = propagated_paths.iter().copied().peekable();
-    while let (Some(&original_path), Some(&propagated_path)) = (original.peek(), propagated.peek())
-    {
-        paths.push(original_path.min(propagated_path));
-        if original_path <= propagated_path {
-            original.next();
-        }
-        if propagated_path <= original_path {
-            propagated.next();
-        }
-    }
-    paths.extend(original);
-    paths.extend(propagated);
+    paths.set(path, false);
 }
 
 impl<'a> PropertyPathRegistry<'a> {
     fn new(alloc: &'a Allocator) -> Self {
-        Self { nodes: Vec::new(), roots: FxHashMap::default(), alloc }
+        Self { nodes: Vec::new(), roots: FxHashMap::default(), has_optional_paths: false, alloc }
     }
 
     fn get_or_create_identifier(
@@ -864,6 +837,7 @@ impl<'a> PropertyPathRegistry<'a> {
         parent_idx: usize,
         entry: &DependencyPathEntry<'a>,
     ) -> usize {
+        self.has_optional_paths |= entry.optional;
         let map_key = entry.property;
         let existing = if entry.optional {
             self.nodes[parent_idx].optional_properties.get(&map_key).copied()
@@ -921,11 +895,15 @@ impl<'a> PropertyPathRegistry<'a> {
 ///
 /// Port of `reduceMaybeOptionalChains` from CollectHoistablePropertyLoads.ts.
 fn reduce_maybe_optional_chains(nodes: &mut PropertyPathSet, registry: &mut PropertyPathRegistry) {
+    // Normalization cannot create optional paths when the registry has none.
+    if !registry.has_optional_paths {
+        return;
+    }
     // Collect indices of nodes that have optional in their path
     let mut optional_chain_nodes: PropertyPathSet =
-        nodes.iter().copied().filter(|&idx| registry.nodes[idx].has_optional).collect();
+        nodes.ones().filter(|&idx| registry.nodes[idx].has_optional).collect();
 
-    if optional_chain_nodes.is_empty() {
+    if optional_chain_nodes.is_clear() {
         return;
     }
 
@@ -935,7 +913,7 @@ fn reduce_maybe_optional_chains(nodes: &mut PropertyPathSet, registry: &mut Prop
         // Collect the indices to process (snapshot to avoid borrow issues)
         let to_process = optional_chain_nodes.clone();
 
-        for original_idx in to_process {
+        for original_idx in to_process.ones() {
             let full_path = registry.nodes[original_idx].full_path.clone_in(registry.alloc);
 
             let mut curr_node = registry.get_or_create_identifier(
@@ -946,7 +924,7 @@ fn reduce_maybe_optional_chains(nodes: &mut PropertyPathSet, registry: &mut Prop
 
             for entry in &full_path.path {
                 // If the base is known to be non-null (in the set), replace optional with non-optional
-                let next_entry = if entry.optional && nodes.binary_search(&curr_node).is_ok() {
+                let next_entry = if entry.optional && nodes.contains(curr_node) {
                     DependencyPathEntry {
                         property: entry.property,
                         computed: entry.computed,
@@ -1275,7 +1253,7 @@ fn collect_non_nulls_in_blocks<'a>(
                 // Get hoistables from inner function's entry block (after propagation)
                 let inner_entry = inner_func.body.entry;
                 if let Some(inner_set) = inner_working.get(&inner_entry) {
-                    for &node_idx in inner_set {
+                    for node_idx in inner_set.ones() {
                         insert_property_path(&mut assumed, node_idx);
                     }
                 }
@@ -1435,7 +1413,7 @@ fn recursively_propagate_non_null(
             continue;
         };
         if has_done_neighbor {
-            state.neighbor_intersection.retain(|path| neighbor_objects.binary_search(path).is_ok());
+            state.neighbor_intersection.intersect_with(neighbor_objects);
         } else {
             state.neighbor_intersection.clone_from(neighbor_objects);
             has_done_neighbor = true;
@@ -1444,14 +1422,18 @@ fn recursively_propagate_non_null(
 
     let objects = working.get_mut(&node_id).expect("missing non-null propagation block");
     state.previous_objects.clone_from(objects);
-    if has_done_neighbor {
-        union_property_paths(objects, &state.previous_objects, &state.neighbor_intersection);
+    // A subset adds nothing; otherwise merge the compact set directly.
+    if has_done_neighbor && !state.neighbor_intersection.is_subset(objects) {
+        objects.union_with(&state.neighbor_intersection);
     }
     reduce_maybe_optional_chains(objects, registry);
 
     state.traversal_state.insert(node_id, TraversalState::Done);
 
-    changed |= state.previous_objects != *objects;
+    // FixedBitSet equality includes capacity. Convergence depends only on members:
+    // normalizing optional paths can clear the highest bit without shrinking it.
+    changed |=
+        !state.previous_objects.is_subset(objects) || !objects.is_subset(&state.previous_objects);
     changed
 }
 
@@ -1558,7 +1540,10 @@ struct ReactiveScopeDependencyTreeHIR<'a> {
 }
 
 impl<'a> ReactiveScopeDependencyTreeHIR<'a> {
-    fn new<'i>(hoistable_objects: impl Iterator<Item = &'i ReactiveScopeDependency<'a>>) -> Self
+    fn new<'i>(
+        hoistable_objects: impl Iterator<Item = &'i ReactiveScopeDependency<'a>>,
+        dependency_roots: &FxHashSet<IdentifierId>,
+    ) -> Self
     where
         'a: 'i,
     {
@@ -1577,7 +1562,9 @@ impl<'a> ReactiveScopeDependencyTreeHIR<'a> {
             b_optional.cmp(&a_optional)
         });
 
-        for dep in sorted_deps {
+        // Filter after sorting so equal-key ordering stays identical to the full tree.
+        for dep in sorted_deps.into_iter().filter(|dep| dependency_roots.contains(&dep.identifier))
+        {
             let root = hoistable_roots.entry(dep.identifier).or_insert_with(|| {
                 let access_type = if !dep.path.is_empty() && dep.path[0].optional {
                     HoistableAccessType::Optional

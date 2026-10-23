@@ -37,9 +37,15 @@ use crate::react_compiler_reactive_scopes::visitors::ReactiveFunctionVisitor;
 // Scopes
 // =============================================================================
 
+#[derive(Default)]
+struct ScopeFrame<'a> {
+    declarations: IdentHashMap<'a, DeclarationId>,
+    next_promoted: [u32; 2],
+}
+
 struct Scopes<'a> {
     seen: FxHashMap<DeclarationId, IdentifierName<'a>>,
-    stack: Vec<IdentHashMap<'a, DeclarationId>>,
+    stack: Vec<ScopeFrame<'a>>,
     globals: IdentHashSet<'a>,
     names: IdentHashSet<'a>,
 }
@@ -48,7 +54,7 @@ impl<'a> Scopes<'a> {
     fn new(globals: IdentHashSet<'a>) -> Self {
         Self {
             seen: FxHashMap::default(),
-            stack: vec![IdentHashMap::default()],
+            stack: vec![ScopeFrame::default()],
             globals,
             names: IdentHashSet::default(),
         }
@@ -72,7 +78,15 @@ impl<'a> Scopes<'a> {
         let is_promoted_jsx = is_promoted && original_value.starts_with("#T");
 
         let mut name: Ident<'a>;
-        let mut id: u32 = 0;
+        let promoted_index = if is_promoted_temp {
+            Some(0)
+        } else if is_promoted_jsx {
+            Some(1)
+        } else {
+            None
+        };
+        let mut id =
+            promoted_index.map_or(0, |index| self.stack.last().unwrap().next_promoted[index]);
         if is_promoted_temp {
             name = format_ident!(env.allocator, "t{}", id);
             id += 1;
@@ -98,13 +112,17 @@ impl<'a> Scopes<'a> {
 
         let identifier_name = IdentifierName::Named(name);
         self.seen.insert(declaration_id, identifier_name);
-        self.stack.last_mut().unwrap().insert(name, declaration_id);
+        let frame = self.stack.last_mut().unwrap();
+        frame.declarations.insert(name, declaration_id);
+        if let Some(index) = promoted_index {
+            frame.next_promoted[index] = id;
+        }
         self.names.insert(name);
     }
 
     fn lookup(&self, name: &str) -> Option<DeclarationId> {
         for scope in self.stack.iter().rev() {
-            if let Some(id) = scope.get(name) {
+            if let Some(id) = scope.declarations.get(name) {
                 return Some(*id);
             }
         }
@@ -112,7 +130,9 @@ impl<'a> Scopes<'a> {
     }
 
     fn enter(&mut self) {
-        self.stack.push(IdentHashMap::default());
+        // Names in outer scopes remain occupied; sibling scopes may reuse names.
+        let next_promoted = self.stack.last().unwrap().next_promoted;
+        self.stack.push(ScopeFrame { declarations: IdentHashMap::default(), next_promoted });
     }
 
     fn leave(&mut self) {

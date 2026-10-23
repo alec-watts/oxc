@@ -87,17 +87,13 @@ pub fn infer_reactive_scope_variables(
         env.scopes[state.scope_id].span = state.span;
     }
 
-    // Update each identifier's mutable_range to match its scope's range
-    for (&_identifier_id, state) in &scopes {
-        let scope_range = env.scopes[state.scope_id].range;
-        // Find all identifiers with this scope and update their mutable_range
-        // We iterate through all identifiers and check their scope
-        for ident in &mut env.identifiers {
-            if ident.scope == Some(state.scope_id) {
-                ident.mutable_range = scope_range;
-            }
-        }
-    }
+    // All members now have their scope's final range. Visit each member once,
+    // rather than rescanning every identifier for every scope.
+    scope_identifiers.for_each(|identifier_id, _| {
+        let ident = &mut env.identifiers[identifier_id];
+        let scope_id = ident.scope.expect("co-mutating identifier must have an assigned scope");
+        ident.mutable_range = env.scopes[scope_id].range;
+    });
 
     // Validate scope ranges
     let mut max_instruction = EvaluationOrder::UNSET;

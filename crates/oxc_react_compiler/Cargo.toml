@@ -41,6 +41,7 @@ oxc_syntax = { workspace = true, features = ["to_js_string"] }
 
 # External crates the vendored React Compiler modules (`src/react_compiler*`) depend
 # on. The compiler core is frontend-agnostic — small utility crates only, no oxc.
+fixedbitset = { workspace = true }
 indexmap = { workspace = true }
 rustc-hash = { workspace = true }
 cow-utils = { workspace = true }
