@@ -1218,9 +1218,15 @@ impl<'a> Codegen<'a> {
     #[cfg(feature = "sourcemap")]
     fn add_source_mapping_for_name(&mut self, span: Span, name: &str) {
         if let Some(sourcemap_builder) = self.sourcemap_builder.as_mut()
-            && !span.is_empty()
+            && (span.start != 0 || span.end != 0)
         {
-            sourcemap_builder.add_source_mapping_for_name(self.code.as_bytes(), span, name);
+            // A generated identifier can have a source position without an authored name.
+            // Preserve that position, while leaving the all-zero synthetic span unmapped.
+            if span.is_empty() {
+                sourcemap_builder.add_source_mapping(self.code.as_bytes(), span.start, None);
+            } else {
+                sourcemap_builder.add_source_mapping_for_name(self.code.as_bytes(), span, name);
+            }
         }
     }
 

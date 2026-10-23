@@ -590,7 +590,15 @@ fn ox_binding_for_identifier_at_span<'a>(
     span: Span,
 ) -> Result<oxc::BindingPattern<'a>, OxcDiagnostic> {
     let name = ox_identifier_name(cx.env, identifier_id)?;
+    let span = ox_identifier_span(cx.env, identifier_id, span);
     Ok(oxc_ast::ast::BindingPattern::new_binding_identifier(span, name, &cx.ast))
+}
+
+// A promoted temporary maps to an expression location, not an authored name.
+// Keep its start coordinate, but do not let codegen copy the entire expression
+// (potentially a whole JSX tree) into the source map's identifier-name table.
+fn ox_identifier_span(env: &Environment<'_>, id: IdentifierId, span: Span) -> Span {
+    if env.identifiers[id].is_promoted { Span::new(span.start, span.start) } else { span }
 }
 
 fn ox_identifier_name<'a>(
@@ -1676,9 +1684,14 @@ fn ox_codegen_instruction<'a>(
     }
     let expr_value = ox_convert_value_to_expression(&cx.ast, value);
     let name = ox_identifier_name(cx.env, lvalue.identifier)?;
+    let identifier_span = ox_identifier_span(cx.env, lvalue.identifier, span);
     if cx.has_declared(lvalue.identifier) {
         let target = oxc::AssignmentTarget::AssignmentTargetIdentifier(
-            oxc_ast::ast::IdentifierReference::boxed(span, ox_str(&cx.ast, &name), &cx.ast),
+            oxc_ast::ast::IdentifierReference::boxed(
+                identifier_span,
+                ox_str(&cx.ast, &name),
+                &cx.ast,
+            ),
         );
         let expr = oxc_ast::ast::Expression::new_assignment_expression(
             span,
@@ -1690,7 +1703,7 @@ fn ox_codegen_instruction<'a>(
         Ok(oxc_ast::ast::Statement::new_expression_statement(span, expr, &cx.ast))
     } else {
         let id = oxc_ast::ast::BindingPattern::new_binding_identifier(
-            span,
+            identifier_span,
             ox_str(&cx.ast, &name),
             &cx.ast,
         );
@@ -2437,7 +2450,7 @@ fn ox_codegen_place<'a>(
     }
     let name = ox_identifier_name(cx.env, place.identifier)?;
     Ok(OxValue::Expression(oxc_ast::ast::Expression::new_identifier(
-        place.span.unwrap_or_default(),
+        ox_identifier_span(cx.env, place.identifier, place.span.unwrap_or_default()),
         ox_str(&cx.ast, &name),
         &cx.ast,
     )))
@@ -2635,8 +2648,11 @@ fn ox_codegen_dependency<'a>(
 ) -> Result<oxc::Expression<'a>, OxcDiagnostic> {
     let name = ox_identifier_name(cx.env, dep.identifier)?;
     let span = dep.span.unwrap_or_default();
-    let mut object =
-        oxc_ast::ast::Expression::new_identifier(span, ox_str(&cx.ast, &name), &cx.ast);
+    let mut object = oxc_ast::ast::Expression::new_identifier(
+        ox_identifier_span(cx.env, dep.identifier, span),
+        ox_str(&cx.ast, &name),
+        &cx.ast,
+    );
     if !dep.path.is_empty() {
         let has_optional = dep.path.iter().any(|p| p.optional);
         // Build every member as a plain member expression carrying its own optional

@@ -231,6 +231,7 @@ pub fn rename_variables<'a>(
         if let Some(mapped_name) = scopes.seen.get(&identifier.declaration_id)
             && identifier.name.is_some()
         {
+            identifier.is_promoted |= matches!(identifier.name, Some(IdentifierName::Promoted(_)));
             identifier.name = Some(*mapped_name);
         }
     }

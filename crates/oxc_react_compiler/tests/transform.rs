@@ -73,6 +73,43 @@ fn memoizes_a_component_end_to_end() {
 }
 
 #[test]
+fn promoted_temporaries_keep_positions_without_expression_names() {
+    // A large JSX tree used to be copied into the name table for each generated
+    // temporary. Keep the original location, but only authored identifiers have names.
+    let source = "export function Component({ text }) {\n  return <section><div>{text}</div><div>{text}</div></section>;\n}";
+    let allocator = Allocator::default();
+    let (program, result) = transform_source(source, SourceType::tsx(), &allocator, options());
+    assert!(result.changed);
+    assert!(result.diagnostics.is_empty());
+    let output = Codegen::new()
+        .with_options(oxc_codegen::CodegenOptions {
+            source_map_path: Some("Component.tsx".into()),
+            ..Default::default()
+        })
+        .build(&program);
+    let map = output.map.unwrap();
+    assert!(map.get_names().all(|name| !name.contains('<') && !name.contains('{')));
+    assert_eq!(map.get_source_content(0), Some(source));
+    let lookup = map.generate_lookup_table();
+    // Both the temporary's declaration and its returned reference still point to
+    // the JSX expression. A zero-width span must not silently erase those mappings.
+    for needle in ["let t1", "return t1"] {
+        let (line, text) =
+            output.code.lines().enumerate().find(|(_, line)| line.contains(needle)).unwrap();
+        let col = text.find("t1").unwrap();
+        let token = map.lookup_token(&lookup, line as u32, col as u32).unwrap();
+        assert_eq!((token.get_src_line(), token.get_src_col()), (1, 9), "{needle}");
+        assert_eq!(token.get_name_id(), None);
+    }
+    // The authored text reference retains its own exact source coordinate.
+    let (line, text) =
+        output.code.lines().enumerate().find(|(_, line)| line.contains("<section>")).unwrap();
+    let col = text.find("{text}").unwrap() + 1;
+    let token = map.lookup_token(&lookup, line as u32, col as u32).unwrap();
+    assert_eq!((token.get_src_line(), token.get_src_col()), (1, 24));
+}
+
+#[test]
 fn allows_ref_access_in_a_returned_event_handler() {
     let source = "\
 function Component({ onChange, onInput }) {\n\

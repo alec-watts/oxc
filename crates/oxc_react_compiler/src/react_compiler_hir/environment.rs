@@ -297,6 +297,7 @@ impl<'a> Environment<'a> {
         let type_id = self.make_type();
         let mutable_range = self.new_mutable_range(EvaluationOrder::UNSET, EvaluationOrder::UNSET);
         self.identifiers.push(Identifier {
+            is_promoted: false,
             id,
             declaration_id: DeclarationId::from_usize(id.index()),
             name: None,

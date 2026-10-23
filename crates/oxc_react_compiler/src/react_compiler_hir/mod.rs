@@ -1039,6 +1039,8 @@ pub struct Place {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Identifier<'a> {
+    /// Promoted temporaries have no authored identifier name at their expression span.
+    pub is_promoted: bool,
     pub id: IdentifierId,
     pub declaration_id: DeclarationId,
     pub name: Option<IdentifierName<'a>>,
